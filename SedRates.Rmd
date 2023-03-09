@@ -1,0 +1,717 @@
+---
+title: "SedRates"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Introduction
+
+210Pb Sedimentation rates of surface sediments on the Norwegian continental margin is spatially predicted based on observations (response variable) and predictor variables using quantile regression forests. 
+
+# Preparations
+
+## Install packages
+
+```{r packages, message=FALSE, warning=FALSE}
+rm(list=ls())
+
+library(raster)
+library(terra)
+library(stars)
+library(Boruta)
+library(caret)
+library(usdm)
+library(corrplot)
+library(ggplot2)
+library(sf)
+library(CAST)
+library(randomForest)
+library(blockCV)
+library(automap)
+library(gstat)
+library(foreach)
+library(doParallel)
+library(ModelMetrics)
+library(forcats)
+library(dplyr)
+```
+
+
+## Define projection and resolution
+
+Projection based on https://projectionwizard.org/ using the AoI.
+Is it possible to automate the selection of the CSR based on the AoI?
+
+```{r projection}
+#Norway
+crs <- "+proj=laea +lat_0=90 +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs" 
+res <- 4000
+```
+
+
+## Define Area of Interest (AoI)
+
+Define the area of interest either by bounding coordinates or by loading a shapefile.
+
+```{r aoi}
+AoI <- read_sf("input/AoI_Harris.shp")
+```
+
+
+# Predictor variables
+
+## Load raster stack with predictor variables
+
+A raster stack with potentially relevant predictor variables is loaded.
+
+```{r load_predictors}
+predictors <- rast("input/predictors_ngb.tif")
+mud <- extend(rast("N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Kornstørrelse/R/GSM_model/output/mud_2023-03-06.tif"), predictors)
+sedenv <- extend(rast(list.files(path = "N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Sedimentasjon/R/SedEnv/output", pattern='SedEnv3_probabilities2023-03-07_', full.names = TRUE)), predictors)
+predictors <- c(predictors, mud, sedenv)
+names(predictors)[38] <- "MUD"
+names(predictors)[39] <- "DEPOprob"
+names(predictors)[40] <- "EROprob"
+names(predictors)[41] <- "NDEPprob"
+```
+
+
+## Ensure uniform projection
+
+Check if AoI and predictors have the defined projection. Re-project if this is not the case.
+
+```{r}
+if (st_crs(AoI)$proj4string != crs) {
+  AoI <- st_transform(AoI, crs)
+}
+
+if (crs(predictors) != crs) {
+  predictors <- project(predictors, crs, res = res)
+}
+```
+
+## Limit to predictors that are relevant for mapping sedimentation rates
+
+```{r limit_predictors}
+predictors <- predictors[[-c(12,13,14,15,34,35,36,37)]]
+names(predictors)
+```
+
+
+
+## Crop predictors to AoI
+
+```{r crop_predictors}
+predictors <- mask(crop(predictors, AoI), AoI)
+plot(predictors)
+```
+
+
+## Minimum extent
+
+Create an unprojected spatial polygon giving the minimum extent of all predictors. This will be used to limit the response data to those points for which predictor variable data can be extracted.
+
+```{r min_extent}
+min_ext <- sum(predictors)
+min_ext[min_ext > 0] <- 1
+min_ext <- as.polygons(min_ext, dissolve = TRUE)
+min_ext <- project(min_ext, "+proj=longlat +datum=WGS84 +no_defs")
+```
+
+
+## Create a fishnet based on predictor raster
+
+```{r fishnet}
+fishnet <- st_as_sf(stars::st_as_stars(predictors[[1]]), as_points = FALSE, merge = FALSE)
+fishnet$ID <- 1:nrow(fishnet)
+```
+
+
+# Response variable
+
+## Type of response?
+
+Define which property is used as response data.
+
+```{r response_type}
+resp_type <- "SAR"
+resp_unit <- "cm/yr"
+```
+
+
+## Load response
+
+```{r load_response}
+resp_data <- read.csv("input/norway_sar_05_04_2022.csv", header = TRUE, sep = ",")
+#resp_data <- subset(resp_data, core_id != 12379 & core_id != 12380) # Rates possibly too high due to bioturbation
+resp <- resp_data[,c(1,2,3,22)] #Reduce to required columns
+summary(resp)
+```
+
+
+## Convert to spatial object
+
+```{r convert_to_spatial}
+resp <- st_as_sf(resp, coords = c(3,2), crs = CRS("+proj=longlat +datum=WGS84 +no_defs"))
+```
+
+
+## Clip to minimum extent
+
+```{r clip_response}
+resp <- st_intersection(resp, st_as_sf(min_ext))
+```
+
+
+## Reproject
+
+Reproject to the previously defined projection.
+
+```{r reproject}
+resp <- st_transform(resp, crs)
+```
+
+
+## Pseudo-samples
+
+To account for areas where erosion dominates, pseudo-samples with a sedimentation rate of 0 cm/yr will be created. The creation of pseudo-samples is based on the spatial model of the sedimentary environment. To increase the likelihood of a correct assignment, pseudo-samples will be restricted to erosional areas with a probability of equal to or larger than 0.9 and within the area of applicability.
+
+### Create a mask
+
+First, a mask is created. Samples will be randomly assigned within the mask.
+
+```{r create_mask}
+# Load erosion probabilities
+erosion_prob <- rast("N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Sedimentasjon/R/SedEnv/output/SedEnv3_probabilities2023-03-07_5.tif")
+
+# Matrix to reclassify probabilities
+m <- c(0, 0.9, 0, 0.9, 1, 1)
+rcl_matrix <- matrix(m, ncol = 3, byrow = TRUE)
+
+# Reclassify
+e90 <- classify(erosion_prob, rcl_matrix, right = FALSE)
+
+# Load AOA
+aoa <- rast("N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Sedimentasjon/R/SedEnv/output/SedEnv3_AOA2023-03-07.tif")
+
+mask <- e90 * aoa
+```
+
+
+### Calculate number of pseudo-samples
+
+The number of pseudo-samples to be created will be proportional to the size of the mask, in which the samples are created.
+
+```{r number_pseudo-samples}
+fr <- freq(mask)
+f <- fr$count[2]/sum(fr$count)
+
+n <- round(f/(1-f)*nrow(resp))
+```
+
+
+### Create pseudo-samples
+
+Pseudo-samples are then created randomly.
+
+```{r create_pseudo_samples}
+mask[mask == 0] <- NA
+
+set.seed(42)
+pseudo_smp <- spatSample(mask, size = n, method = "random", na.rm = TRUE, as.points = TRUE)
+
+pseudo_smp <- st_as_sf(pseudo_smp)
+names(pseudo_smp)[1] <- "sum"
+pseudo_smp$core_id <- "pseudo_sample"
+pseudo_smp$SAR_cm_yr <- 0
+pseudo_smp <- pseudo_smp[,c(3,4,1,2)]
+```
+
+
+## Combine both datasets
+
+```{r combine}
+resp <- rbind(resp, pseudo_smp)
+```
+
+
+## Centroids
+
+```{r centroids, warning=FALSE}
+centroids <- st_join(fishnet, resp)
+
+centroids <- na.omit(centroids)
+
+centroids <- centroids %>% group_by(ID) %>% summarize(SAR_cm_yr = mean(SAR_cm_yr, na.rm = TRUE))
+
+centroids <- st_centroid(centroids)
+
+resp_centr <- centroids
+
+plot(predictors[[1]])
+plot(resp_centr$geometry, pch = 20, add = TRUE)
+
+write_sf(resp_centr, "output/sample_centroids.shp", overwrite = TRUE)
+```
+
+
+## Create a regression matrix
+
+```{r regression_matrix}
+ov_resp <- as.data.frame(extract(predictors, resp_centr))
+
+rm_resp <- cbind(resp_centr$SAR_cm_yr, ov_resp)
+rm_resp <- rm_resp[,-2]
+names(rm_resp)[1] <- "SAR"
+
+summary(rm_resp)
+```
+
+
+## Data exploration
+
+### SAR
+
+```{r hist_SAR}
+hist(rm_resp$SAR, main = "", xlab = paste0(resp_type, " (", resp_unit, ")"))
+```
+
+
+### Transformed SAR
+
+```{r transformed_sar}
+hist(sqrt(rm_resp$SAR), main = "", xlab = paste0("sqrt(", resp_type, ")"))
+hist(log1p(rm_resp$SAR), main = "", xlab = paste0("log(", resp_type, " + 1)"))
+hist(1/(rm_resp$SAR), main = "", xlab = paste0("1/", resp_type))
+```
+
+
+# Predictor variable selection
+
+## Boruta algorithm
+
+Although two models will be built, it is sufficient to run the Boruta algorithm only once, as the predictors and the sample locations are identical.
+
+```{r boruta}
+set.seed(42)
+B <- Boruta(rm_resp[[1]] ~ .,data = rm_resp[2:ncol(rm_resp)], pValue = 0.05,
+             maxRuns = 500)
+B
+par(mar=c(13,4,1,1), cex = 0.6)
+plot(B, las=2, colCode = c("greenyellow", "yellow2", "red3", "cadetblue"), xlab = "")
+```
+
+
+## De-correlation analysis
+
+To reduce redundancy in information, a de-correlation analysis is carried out. Of those predictor variables identified as important in the Boruta analysis, only those with a correlation coefficient below a set threshold are retained. However, a universally applicable threshold does not exist. Additionally, multicollinearity, i.e., collinearity between three or more variables, might exist in the data. Variance inflation factors (VIFs) are therefore additionally calculated to check for multicollinearity. As a rule of thumb, VIFs larger than 5 or 10 indicate a problematic amount of collinearity (James et al., 2017: pp. 101-102; doi: 10.1080/24754269.2021.1980261). According to Johnston et al. (2017; doi: 10.1007/s11135-017-0584-6) a VIF of 2.5 or greater is generally considered indicative of considerable collinearity.
+
+```{r de-corr, message=FALSE, warning=FALSE}
+th <- 1
+
+repeat{
+ cor_result<- vifcor(rm_resp[rownames(subset(attStats(B), decision == "Confirmed"))], th = th,  maxobservations = nrow(rm_resp))
+ if (max(cor_result@results[,2]) >= 2.5){
+   th <- th - 0.01
+ } else {
+   break
+ }
+}
+
+max(cor_result@results[,2])
+cor_result
+
+sel_preds <- cor_result@results$Variables
+seldata <- rm_resp[c(resp_type, sel_preds)]
+```
+
+
+##  Correlation plot
+
+```{r correlation_plot}
+corrplot.mixed(cor(rm_resp[sel_preds]), lower.col =  "black", tl.pos = "lt", number.cex = 0.6)
+```
+
+
+## Environmental space
+
+A visual check to what extent the samples cover the environmental space. This is useful as legacy data were used and no formal sampling design was applied in the analysis.
+
+* Blue: Samples
+
+* Grey: Environmental data (based on random subsample)
+
+```{r env_space}
+smp <- as.data.frame(spatSample(x = predictors[[sel_preds]], size = nrow((rm_resp)), method = "random", na.rm = TRUE))
+
+for (i in 2:ncol(seldata)) {
+    
+  print(ggplot() +
+          geom_density(data = seldata, aes(x=seldata[,i]),
+          colour = "cornflowerblue", fill = "cornflowerblue", alpha = 0.1,linewidth = 1) +
+          geom_density(data = smp, aes(x = smp[,i-1]), colour = "grey",fill = "grey", alpha = 0.1, linewidth = 1) +
+          scale_x_continuous(name = names(seldata[i])) +
+          theme_bw())
+        
+}
+```
+
+
+## 2D plots of environmental space
+
+```{r 2d_env_plots}
+
+for (i in sel_preds[2:length(sel_preds)]) {
+  
+  print(ggplot() +
+    geom_point(data = smp, aes(x = smp[,i], y = smp[,1]), colour = "grey", alpha = 1, size = 2) +
+    geom_point(data = seldata, aes(x = seldata[,i], y = seldata[,2]), colour = "cornflowerblue", alpha = 1, size = 2) +
+    scale_x_continuous(name = names(seldata[i]))+
+    ylab(sel_preds[1]) +
+    theme_bw())
+}
+```
+
+
+## Distances in environmental space 
+
+```{r env_space_dist}
+dist_env <- plot_geodist(resp_centr, predictors,
+                     type = "feature",
+                     variables = sel_preds,
+                     showPlot = FALSE)
+
+dist_env$plot
+dist_env$plot + scale_x_log10()
+```
+
+
+## Distances in geographic space
+
+```{r geogr_space_dist, message=FALSE}
+dist_geogr <- plot_geodist(resp_centr, predictors,
+                     type = "geo",
+                     unit = "km", # Requires CAST version >= 0.7.0
+                     showPlot = FALSE)
+
+dist_geogr$plot
+dist_geogr$plot + scale_x_log10()
+```
+
+
+# Quantile Regression Forest model
+
+## Spatial autocorrelation range
+
+The spatial dependence structure in the raw data is determined. Specifically, the distance (range) up to which observations are spatially autocorrelated is estimated with a variogram.
+
+```{r spatial_autocorrelation_range}
+vf <- autofitVariogram(sqrt(SAR_cm_yr) ~ 1, as(resp_centr, "Spatial")
+                       #, model = c("Sph", "Exp", "Gau", "Mat", "Ste")
+                       )
+plot(vf)
+sar <- vf$var_model$range[2]
+```
+
+
+## Creating spatial blocks
+
+Spatial blocks and folds are created. The folds will be used in a spatial k-fold cross validation. The size of the blocks is determined by the spatial autocorrelation range.
+
+Roberts et. al. (2017) suggest that blocks should be substantially bigger than the range of spatial autocorrelation (in model residual) to obtain realistic error estimates, while a buffer with the size of the spatial autocorrelation range would result in a good estimation of error.
+
+*Should we increase the block size? This could be gauged by looking at the geographic distances plot below. The block size might be right, when sample-to-prediction and CV distances look similar.*
+
+```{r spatial_blocks, warning=FALSE}
+k <- 10 # Number of folds
+m <- 0.06 # Multiplier applied to block size
+
+spBlocks <- spatialBlock(resp_centr, 
+                         rasterLayer = as(predictors[[1]], "Raster"), 
+                         theRange = sar * m, 
+                         k = k,
+                         seed = 42,
+                         progress = FALSE)
+
+#write_sf(spBlocks$blocks, "output/spBlocks.shp")
+```
+
+
+## Reshaping index
+
+The output from the blocking step needs to be reshaped.
+
+```{r reshape_index}
+index <- list()
+for (n in 1:spBlocks$k) {
+  f <- spBlocks[["folds"]][[n]][[-2]]
+  index[[length(index)+1]] <- f
+}
+```
+
+
+## Distances in geographic space including CV distances
+
+```{r geogr_space_dist2}
+dist_geogr2 <- plot_geodist(resp_centr, predictors,
+                     cvfolds= index,
+                     type = "geo",
+                     unit="km",  # Requires CAST version >= 0.7.0
+                     showPlot = FALSE)
+
+dist_geogr2$plot
+dist_geogr2$plot + scale_x_log10()
+```
+
+
+## Model tuning
+
+A Random Forest model is tuned. Predictor variables are finally selected in a forward feature selection approach and various values of the mtry parameter are tested in a spatial k-fold cross validation.
+
+This step is time-consuming and memory-heavy. Therefore, only a subset of possible mtry values is tested. These are multiples of the default mtry values or the default values. 
+
+The maximum number of iterations can be calculated upfront, based on the number of pre-selected predictors:
+
+```{r max_iter}
+factorial(length(sel_preds))/(factorial(2)*factorial(length(sel_preds)-2)) + sum(c((length(sel_preds)-2):1))
+```
+
+
+### Forward feature selection
+
+The best combination of predictor variables (features) is found in a forward feature selection process.
+
+
+```{r model_tuning}
+nCores <- detectCores()
+cl <- makePSOCKcluster(nCores - 1)
+registerDoParallel(cl)
+
+set.seed(42)
+
+model <- ffs(seldata[sel_preds],
+               seldata$SAR,
+               metric = "Rsquared",
+               method="qrf",
+               what = 0.5,
+               replace = FALSE,
+               importance = TRUE,
+               #tuneGrid = expand.grid(mtry =  round(floor(sqrt(length(sel_preds)))*c(1,1.5,2,3))),
+               trControl = trainControl(method="CV",
+                                        number = k,
+                                        savePredictions = "final",
+                                        index = index, 
+                                        allowParallel = TRUE),
+               verbose = TRUE)
+
+stopCluster(cl)
+
+model
+
+sel_preds <- model$selectedvars
+```
+
+
+### FFS plot
+
+Plot of R2 over the model runs.
+
+```{r ffs_plot}
+plot_ffs(model)
+```
+
+
+## Validation statistics
+
+The validation results of the optimal RF model.
+
+Note that these are the statistics based on the predicted values of the selected model. These differ slightly from the values from the tuning (above), which are the means of the k predictions based on the folds.
+
+```{r validation_stats}
+t <- data.frame(model$pred$pred, model$pred$obs)
+
+validation <- data.frame(mse=numeric(), rmse=numeric(), r2=numeric())
+validation[1,1] <- round(mse(t$model.pred.obs, t$model.pred.pred), 3)
+validation[1,2] <- round(rmse(t$model.pred.obs, t$model.pred.pred), 3)
+validation[1,3] <- round(cor(t$model.pred.obs, t$model.pred.pred)^2, 3)
+
+colnames(validation) <- c("MSE", "RMSE", "r2")
+rownames(validation) <- NULL
+validation
+```
+
+
+## Validation plot
+
+```{r validation_plot, message=FALSE}
+ggplot(t, aes(x = model.pred.pred, y = model.pred.obs)) +
+  geom_hex(bins = 60) +
+  geom_smooth(method = "lm") +
+  geom_abline(intercept = 0, slope = 1, colour = "grey", linewidth = 1.2) +
+  scale_fill_continuous(type = "viridis") +
+  theme_bw() +
+  scale_x_continuous(name = "Predicted value") +
+  scale_y_continuous(name = "Observed value")
+       
+```
+
+
+## Variable importance
+
+```{r variable_importance_plot}
+imp <- varImp(model$finalModel)
+imp$Predictor <- rownames(imp)
+rownames(imp) <- NULL
+imp <- imp[order(imp[1], decreasing = TRUE), c(2, 1)]
+colnames(imp)[2] <- "IncMSE"
+imp
+
+impfig <- imp %>%
+  mutate(Predictor = fct_reorder(Predictor, IncMSE)) %>%
+  ggplot( aes(x=Predictor, y=IncMSE)) +
+    geom_bar(stat="identity", fill="#f68060", alpha=.6, width=.4) +
+    coord_flip() +
+    xlab("") +
+    ylab("% increase in MSE") +
+    theme_bw()
+    
+impfig
+```
+
+
+## Distances in environmental space including CV distances
+
+```{r env_space_dist2}
+dist_env2 <- plot_geodist(resp_centr, predictors,
+                     type = "feature",
+                     cvfolds= index,
+                     variables = sel_preds,
+                     showPlot = FALSE)
+
+dist_env2$plot
+dist_env2$plot + scale_x_log10()
+```
+
+
+
+## Partial dependence
+
+Partial dependence plots give a graphical depiction of the marginal effect of a variable on the response.
+
+```{r partial_plots}
+m2 <- model$finalModel
+class(m2) <- "randomForest"
+
+for (i in 1:length(sel_preds)) {
+  partialPlot(x = m2, pred.data = seldata, x.var = sel_preds[i], main = "", xlab = sel_preds[i], ylab = paste0(resp_type, " (", resp_unit, ")"))
+}
+```
+
+
+# Predict QRF model
+
+## Predict SAR
+
+```{r predict_sar}
+preds <- stack(predictors[[sel_preds]])
+SAR_med <- predict(preds, model$finalModel, what = 0.5)
+SAR_p95 <- predict(preds, model$finalModel, what = 0.95)
+SAR_p5 <- predict(preds, model$finalModel, what = 0.05)
+SAR_pi90 <- SAR_p95 - SAR_p5
+SAR_pir <- SAR_pi90 / SAR_med
+
+hist(SAR_med, main = "", xlab = paste0(resp_type, " (", resp_unit, ")"))
+```
+
+
+## Area of Applicability
+
+```{r aoa}
+SAR_trainDI <- trainDI(model = model,
+                        variables = sel_preds)
+print(SAR_trainDI)
+
+SAR_aoa <- aoa(newdata = predictors, 
+                model = model,
+                trainDI = SAR_trainDI,
+                variables = sel_preds,
+                )
+
+plot(SAR_aoa)
+```
+
+
+## Plot results
+
+```{r plot_results}
+plot(SAR_med, main = paste0(resp_type, " (", resp_unit, ")"))
+plot(SAR_pi90, main = "90% prediction interval")
+plot(SAR_pir, main = "Prediction interval ratio")
+plot(SAR_aoa$DI, main = "Dissimilarity index")
+plot(SAR_aoa$AOA, main = "Area of applicability")
+
+fr <- freq(SAR_aoa$AOA)
+print(paste0("AOA = ", round(100*fr$count[2]/ sum(fr$count),2), "% of pixels"))
+```
+
+
+## Convert AOA from raster to polygon
+
+```{r aoa_poly}
+aoa_poly <- as.polygons(SAR_aoa$AOA, dissolve = TRUE)
+plot(aoa_poly)
+
+write_sf(st_as_sf(aoa_poly), dsn = "output", layer = paste0(resp_type, "_AOA_", Sys.Date()), driver = "ESRI Shapefile")
+```
+
+
+## Export geoTifs
+
+```{r geotifs}
+writeRaster(SAR_med, paste0("output/", resp_type, "_median_", Sys.Date(), ".tif"), overwrite = TRUE)
+writeRaster(SAR_pi90, paste0("output/", resp_type, "_pi90_", Sys.Date(), ".tif"), overwrite = TRUE)
+writeRaster(SAR_pir, paste0("output/", resp_type, "_pir_", Sys.Date(), ".tif"), overwrite = TRUE)
+writeRaster(SAR_aoa$AOA, paste0("output/", resp_type, "_aoa_", Sys.Date(), ".tif"), overwrite = TRUE)
+```
+
+
+## Output a log file
+
+```{r log}
+sink(file = paste0("output/ModelLog_", Sys.Date(), ".txt"))
+print("Selected Predictors")
+sel_preds
+model
+print("Final Model")
+paste0("MSE = ", validation[1,1])
+paste0("RMSE = ", validation[1,2])
+paste0("R2 = ", validation[1,3])
+paste0("AOA = ", round(100*fr$count[2]/ sum(fr$count),2), "% of pixels")
+sink()
+```
+
+
+# Finishing off
+
+# Save QRF model
+
+```{r save_model}
+saveRDS(model, "qrfmodel.rds")
+```
+
+
+## Save session info
+
+```{r save_session_info}
+sessionInfo <- sessionInfo()
+save(sessionInfo, file = "sessionInfo.Rdata")
+rm("sessionInfo")
+```
+
+
+## Save global environment
+
+```{r save_global_env}
+save.image(file = "globEnv.RData")
+```
