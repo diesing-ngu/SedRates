@@ -1,5 +1,5 @@
 ---
-title: "SedRates"
+title: "Sedimentation Rates - Main"
 output:
   html_document:
     df_print: paged
@@ -7,7 +7,7 @@ output:
 
 # Introduction
 
-210Pb Sedimentation rates of surface sediments on the Norwegian continental margin is spatially predicted based on observations (response variable) and predictor variables using quantile regression forests. 
+210Pb Sedimentation rates of surface sediments on the Norwegian continental margin are spatially predicted based on observations (response variable) and predictor variables using quantile regression forests. 
 
 # Preparations
 
@@ -18,7 +18,8 @@ rm(list=ls())
 
 library(raster)
 library(terra)
-library(stars)
+library(dplyr)
+library(rcompanion)
 library(Boruta)
 library(caret)
 library(usdm)
@@ -26,109 +27,27 @@ library(corrplot)
 library(ggplot2)
 library(sf)
 library(CAST)
-library(randomForest)
+library(lwgeom)
+library(geosphere)
+library(quantregForest)
 library(blockCV)
 library(automap)
 library(gstat)
-library(foreach)
 library(doParallel)
 library(ModelMetrics)
 library(forcats)
-library(dplyr)
 ```
 
 
-## Define projection and resolution
+## Load required data
 
-Projection based on https://projectionwizard.org/ using the AoI.
-Is it possible to automate the selection of the CSR based on the AoI?
+```{r load_data}
+predictors <- rast("input/predictors.tif")
+resp_centr <- vect("input/SAR.shp")
 
-```{r projection}
-#Norway
-crs <- "+proj=laea +lat_0=90 +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs" 
-res <- 4000
-```
-
-
-## Define Area of Interest (AoI)
-
-Define the area of interest either by bounding coordinates or by loading a shapefile.
-
-```{r aoi}
-AoI <- read_sf("input/AoI_Harris.shp")
-```
-
-
-# Predictor variables
-
-## Load raster stack with predictor variables
-
-A raster stack with potentially relevant predictor variables is loaded.
-
-```{r load_predictors}
-predictors <- rast("input/predictors_ngb.tif")
-mud <- extend(rast("N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Kornstørrelse/R/GSM_model/output/mud_2023-03-06.tif"), predictors)
-sedenv <- extend(rast(list.files(path = "N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Sedimentasjon/R/SedEnv/output", pattern='SedEnv3_probabilities2023-03-07_', full.names = TRUE)), predictors)
-predictors <- c(predictors, mud, sedenv)
-names(predictors)[38] <- "MUD"
-names(predictors)[39] <- "DEPOprob"
-names(predictors)[40] <- "EROprob"
-names(predictors)[41] <- "NDEPprob"
-```
-
-
-## Ensure uniform projection
-
-Check if AoI and predictors have the defined projection. Re-project if this is not the case.
-
-```{r}
-if (st_crs(AoI)$proj4string != crs) {
-  AoI <- st_transform(AoI, crs)
-}
-
-if (crs(predictors) != crs) {
-  predictors <- project(predictors, crs, res = res)
-}
-```
-
-## Limit to predictors that are relevant for mapping sedimentation rates
-
-```{r limit_predictors}
-predictors <- predictors[[-c(12,13,14,15,34,35,36,37)]]
 names(predictors)
 ```
 
-
-
-## Crop predictors to AoI
-
-```{r crop_predictors}
-predictors <- mask(crop(predictors, AoI), AoI)
-plot(predictors)
-```
-
-
-## Minimum extent
-
-Create an unprojected spatial polygon giving the minimum extent of all predictors. This will be used to limit the response data to those points for which predictor variable data can be extracted.
-
-```{r min_extent}
-min_ext <- sum(predictors)
-min_ext[min_ext > 0] <- 1
-min_ext <- as.polygons(min_ext, dissolve = TRUE)
-min_ext <- project(min_ext, "+proj=longlat +datum=WGS84 +no_defs")
-```
-
-
-## Create a fishnet based on predictor raster
-
-```{r fishnet}
-fishnet <- st_as_sf(stars::st_as_stars(predictors[[1]]), as_points = FALSE, merge = FALSE)
-fishnet$ID <- 1:nrow(fishnet)
-```
-
-
-# Response variable
 
 ## Type of response?
 
@@ -140,119 +59,11 @@ resp_unit <- "cm/yr"
 ```
 
 
-## Load response
+## Plot data
 
-```{r load_response}
-resp_data <- read.csv("input/norway_sar_05_04_2022.csv", header = TRUE, sep = ",")
-#resp_data <- subset(resp_data, core_id != 12379 & core_id != 12380) # Rates possibly too high due to bioturbation
-resp <- resp_data[,c(1,2,3,22)] #Reduce to required columns
-summary(resp)
-```
-
-
-## Convert to spatial object
-
-```{r convert_to_spatial}
-resp <- st_as_sf(resp, coords = c(3,2), crs = CRS("+proj=longlat +datum=WGS84 +no_defs"))
-```
-
-
-## Clip to minimum extent
-
-```{r clip_response}
-resp <- st_intersection(resp, st_as_sf(min_ext))
-```
-
-
-## Reproject
-
-Reproject to the previously defined projection.
-
-```{r reproject}
-resp <- st_transform(resp, crs)
-```
-
-
-## Pseudo-samples
-
-To account for areas where erosion dominates, pseudo-samples with a sedimentation rate of 0 cm/yr will be created. The creation of pseudo-samples is based on the spatial model of the sedimentary environment. To increase the likelihood of a correct assignment, pseudo-samples will be restricted to erosional areas with a probability of equal to or larger than 0.9 and within the area of applicability.
-
-### Create a mask
-
-First, a mask is created. Samples will be randomly assigned within the mask.
-
-```{r create_mask}
-# Load erosion probabilities
-erosion_prob <- rast("N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Sedimentasjon/R/SedEnv/output/SedEnv3_probabilities2023-03-07_5.tif")
-
-# Matrix to reclassify probabilities
-m <- c(0, 0.9, 0, 0.9, 1, 1)
-rcl_matrix <- matrix(m, ncol = 3, byrow = TRUE)
-
-# Reclassify
-e90 <- classify(erosion_prob, rcl_matrix, right = FALSE)
-
-# Load AOA
-aoa <- rast("N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Sedimentasjon/R/SedEnv/output/SedEnv3_AOA2023-03-07.tif")
-
-mask <- e90 * aoa
-```
-
-
-### Calculate number of pseudo-samples
-
-The number of pseudo-samples to be created will be proportional to the size of the mask, in which the samples are created.
-
-```{r number_pseudo-samples}
-fr <- freq(mask)
-f <- fr$count[2]/sum(fr$count)
-
-n <- round(f/(1-f)*nrow(resp))
-```
-
-
-### Create pseudo-samples
-
-Pseudo-samples are then created randomly.
-
-```{r create_pseudo_samples}
-mask[mask == 0] <- NA
-
-set.seed(42)
-pseudo_smp <- spatSample(mask, size = n, method = "random", na.rm = TRUE, as.points = TRUE)
-
-pseudo_smp <- st_as_sf(pseudo_smp)
-names(pseudo_smp)[1] <- "sum"
-pseudo_smp$core_id <- "pseudo_sample"
-pseudo_smp$SAR_cm_yr <- 0
-pseudo_smp <- pseudo_smp[,c(3,4,1,2)]
-```
-
-
-## Combine both datasets
-
-```{r combine}
-resp <- rbind(resp, pseudo_smp)
-```
-
-
-## Centroids
-
-```{r centroids, warning=FALSE}
-centroids <- st_join(fishnet, resp)
-
-centroids <- na.omit(centroids)
-
-centroids <- centroids %>% group_by(ID) %>% summarize(SAR_cm_yr = mean(SAR_cm_yr, na.rm = TRUE))
-
-centroids <- st_centroid(centroids)
-
-resp_centr <- centroids
-
-plot(predictors[[1]])
-plot(resp_centr$geometry, pch = 20, add = TRUE)
-
-write_sf(resp_centr, "output/sample_centroids.shp", overwrite = TRUE)
+```{r plot_data}
+plot(predictors$BATH)
+plot(resp_centr, pch = 20, col = "black", cex = 0.5, add = TRUE)
 ```
 
 
@@ -263,7 +74,7 @@ ov_resp <- as.data.frame(extract(predictors, resp_centr))
 
 rm_resp <- cbind(resp_centr$SAR_cm_yr, ov_resp)
 rm_resp <- rm_resp[,-2]
-names(rm_resp)[1] <- "SAR"
+names(rm_resp)[1] <- resp_type
 
 summary(rm_resp)
 ```
@@ -271,19 +82,32 @@ summary(rm_resp)
 
 ## Data exploration
 
+### SAR versus water depth
+
+```{r sar_wdepth}
+plot(rm_resp$SAR, rm_resp$BATH, xlab = paste0(resp_type, " (", resp_unit, ")"), ylab = "Water depth (m)")
+```
+
+
 ### SAR
 
-```{r hist_SAR}
+```{r hist_sar}
 hist(rm_resp$SAR, main = "", xlab = paste0(resp_type, " (", resp_unit, ")"))
 ```
 
 
-### Transformed SAR
+### Transformation
 
-```{r transformed_sar}
-hist(sqrt(rm_resp$SAR), main = "", xlab = paste0("sqrt(", resp_type, ")"))
-hist(log1p(rm_resp$SAR), main = "", xlab = paste0("log(", resp_type, " + 1)"))
-hist(1/(rm_resp$SAR), main = "", xlab = paste0("1/", resp_type))
+The response data are transformed to approach a normal distribution. This is necessary for semivariogram fitting.
+
+Null hypothesis: The data are normally distributed. If p > 0.05, normality can be assumed.
+
+```{r transformation}
+if(nrow(rm_resp) > 5000) {
+  lambda <- transformTukey(sample(rm_resp$SAR, 5000), plotit = TRUE, quiet = FALSE, returnLambda = TRUE)
+  } else {
+  lambda <- transformTukey(rm_resp$SAR, plotit = TRUE, quiet = FALSE, returnLambda = TRUE)
+}
 ```
 
 
@@ -296,7 +120,7 @@ Although two models will be built, it is sufficient to run the Boruta algorithm 
 ```{r boruta}
 set.seed(42)
 B <- Boruta(rm_resp[[1]] ~ .,data = rm_resp[2:ncol(rm_resp)], pValue = 0.05,
-             maxRuns = 500)
+             maxRuns = 10000)
 B
 par(mar=c(13,4,1,1), cex = 0.6)
 plot(B, las=2, colCode = c("greenyellow", "yellow2", "red3", "cadetblue"), xlab = "")
@@ -322,6 +146,7 @@ repeat{
 max(cor_result@results[,2])
 cor_result
 
+#sel_preds <- names(rm_resp)[2:ncol(rm_resp)]
 sel_preds <- cor_result@results$Variables
 seldata <- rm_resp[c(resp_type, sel_preds)]
 ```
@@ -377,22 +202,22 @@ for (i in sel_preds[2:length(sel_preds)]) {
 ## Distances in environmental space 
 
 ```{r env_space_dist}
-dist_env <- plot_geodist(resp_centr, predictors,
-                     type = "feature",
-                     variables = sel_preds,
-                     showPlot = FALSE)
+#dist_env <- plot_geodist(st_as_sf(resp_centr), predictors,
+#                     type = "feature",
+#                     variables = sel_preds,
+#                     showPlot = FALSE)
 
-dist_env$plot
-dist_env$plot + scale_x_log10()
+#dist_env$plot
+#dist_env$plot + scale_x_log10()
 ```
 
 
 ## Distances in geographic space
 
 ```{r geogr_space_dist, message=FALSE}
-dist_geogr <- plot_geodist(resp_centr, predictors,
+dist_geogr <- plot_geodist(st_as_sf(resp_centr), predictors,
                      type = "geo",
-                     unit = "km", # Requires CAST version >= 0.7.0
+                     unit = "km",
                      showPlot = FALSE)
 
 dist_geogr$plot
@@ -402,13 +227,75 @@ dist_geogr$plot + scale_x_log10()
 
 # Quantile Regression Forest model
 
+## Quick RF model without spatial CV
+
+```{r quick_rf, warning=FALSE}
+set.seed(42)
+rf <- randomForest(SAR ~ ., seldata, replace = FALSE)
+
+t <- data.frame(rf$pred, rf$y)
+
+validation <- data.frame(mse=numeric(), rmse=numeric(), r2=numeric())
+validation[1,1] <- round(mse(t$rf.y, t$rf.pred), 3)
+validation[1,2] <- round(rmse(t$rf.y, t$rf.pred), 3)
+validation[1,3] <- round(cor(t$rf.y, t$rf.pred)^2, 3)
+
+colnames(validation) <- c("MSE", "RMSE", "r2")
+rownames(validation) <- NULL
+validation
+
+ggplot(t, aes(x = rf.pred, y = rf.y)) +
+  geom_bin2d(bins = 60) +
+  geom_smooth(method = "lm") +
+  geom_abline(intercept = 0, slope = 1, colour = "grey", linewidth = 1.2) +
+  scale_fill_continuous(type = "viridis") +
+  theme_bw() +
+  scale_x_continuous(name = "Predicted value") +
+  scale_y_continuous(name = "Observed value") +
+  ggtitle("RF mean")
+
+imp <- varImp(rf, scale = FALSE)
+imp$Predictor <- rownames(imp)
+rownames(imp) <- NULL
+imp <- imp[order(imp[1], decreasing = TRUE), c(2, 1)]
+colnames(imp)[2] <- "IncMSE"
+
+impfig <- imp %>%
+  mutate(Predictor = fct_reorder(Predictor, IncMSE)) %>%
+  ggplot( aes(x=Predictor, y=IncMSE)) +
+    geom_bar(stat="identity", fill="#f68060", alpha=.6, width=.4) +
+    coord_flip() +
+    xlab("") +
+    ylab("% increase in MSE") +
+    theme_bw()
+    
+impfig
+```
+
+
 ## Spatial autocorrelation range
+
+### SAR based on observations
 
 The spatial dependence structure in the raw data is determined. Specifically, the distance (range) up to which observations are spatially autocorrelated is estimated with a variogram.
 
-```{r spatial_autocorrelation_range}
-vf <- autofitVariogram(sqrt(SAR_cm_yr) ~ 1, as(resp_centr, "Spatial")
-                       #, model = c("Sph", "Exp", "Gau", "Mat", "Ste")
+*Data need to be in an equidistant projection and (approximately) normally distributed.*
+
+```{r spatial_autocorrelation_range_obs}
+SAR_pr <- project(x = resp_centr, y = "+proj=eqdc +lon_0=12.5 +lat_1=59.5 +lat_2=77.5 +lat_0=68.5 +datum=WGS84 +units=m +no_defs")
+SAR_pr <- as(SAR_pr, "Spatial")
+
+if (lambda >  0){
+  SAR_pr$SAR_cm_yr = SAR_pr$SAR_cm_yr ^ lambda
+} else if (lambda == 0){
+    SAR_pr$SAR_cm_yr = log(SAR_pr$SAR_cm_yr)
+} else if (lambda <  0){
+      SAR_pr$SAR_cm_yr = -1 * SAR_pr$SAR_cm_yr ^ lambda}
+
+# automap package
+vf <- autofitVariogram(SAR_cm_yr ~ 1, 
+                       SAR_pr, 
+                       #cutoff = 5000000
                        )
 plot(vf)
 sar <- vf$var_model$range[2]
@@ -425,16 +312,14 @@ Roberts et. al. (2017) suggest that blocks should be substantially bigger than t
 
 ```{r spatial_blocks, warning=FALSE}
 k <- 10 # Number of folds
-m <- 0.06 # Multiplier applied to block size
+m <- 0.35 # Multiplier applied to block size
 
-spBlocks <- spatialBlock(resp_centr, 
-                         rasterLayer = as(predictors[[1]], "Raster"), 
-                         theRange = sar * m, 
-                         k = k,
-                         seed = 42,
-                         progress = FALSE)
-
-#write_sf(spBlocks$blocks, "output/spBlocks.shp")
+spBlocks <- cv_spatial(x = SAR_pr,
+                       k = k,
+                       #hexagon = FALSE,
+                       size = sar * m,
+                       seed = 42,
+                       progress = FALSE)
 ```
 
 
@@ -443,21 +328,24 @@ spBlocks <- spatialBlock(resp_centr,
 The output from the blocking step needs to be reshaped.
 
 ```{r reshape_index}
-index <- list()
+index_train <- list()
+index_val <- list()
 for (n in 1:spBlocks$k) {
-  f <- spBlocks[["folds"]][[n]][[-2]]
-  index[[length(index)+1]] <- f
+  ft <- spBlocks[["folds_list"]][[n]][[-2]]
+  fv <- spBlocks[["folds_list"]][[n]][[2]]
+  index_train[[length(index_train)+1]] <- ft
+  index_val[[length(index_val)+1]] <- fv
 }
 ```
 
 
 ## Distances in geographic space including CV distances
 
-```{r geogr_space_dist2}
-dist_geogr2 <- plot_geodist(resp_centr, predictors,
-                     cvfolds= index,
+```{r geogr_space_dist2, message=FALSE}
+dist_geogr2 <- plot_geodist(st_as_sf(resp_centr), predictors,
+                     cvfolds= index_val,
                      type = "geo",
-                     unit="km",  # Requires CAST version >= 0.7.0
+                     unit="km",
                      showPlot = FALSE)
 
 dist_geogr2$plot
@@ -501,7 +389,7 @@ model <- ffs(seldata[sel_preds],
                trControl = trainControl(method="CV",
                                         number = k,
                                         savePredictions = "final",
-                                        index = index, 
+                                        index = index_train, 
                                         allowParallel = TRUE),
                verbose = TRUE)
 
@@ -583,14 +471,14 @@ impfig
 ## Distances in environmental space including CV distances
 
 ```{r env_space_dist2}
-dist_env2 <- plot_geodist(resp_centr, predictors,
-                     type = "feature",
-                     cvfolds= index,
-                     variables = sel_preds,
-                     showPlot = FALSE)
+#dist_env2 <- plot_geodist(st_as_sf(resp_centr), predictors,
+#                     type = "feature",
+#                     cvfolds= index,
+#                     variables = sel_preds,
+#                     showPlot = FALSE)
 
-dist_env2$plot
-dist_env2$plot + scale_x_log10()
+#dist_env2$plot
+#dist_env2$plot + scale_x_log10()
 ```
 
 
