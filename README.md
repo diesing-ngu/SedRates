@@ -1,6 +1,6 @@
 ## Sediment accumulation rates
 
-Workflow to spatially predict ^210^Pb-based sedimentation rates of seafloor sediments of the Norwegian continental shelf and slope. The workflow accounts for areas where erosion and sediment transport occurs by randomly inserting pseudo-samples with a sedimentation rate of 0 cm/yr.
+Workflow to spatially predict 210Pb-based sedimentation rates of seafloor sediments of the Norwegian continental shelf and slope. The workflow accounts for areas where erosion and sediment transport occurs by randomly inserting pseudo-samples with a sedimentation rate of 0 cm/yr.
 
 ### Model outputs
 
