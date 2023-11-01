@@ -1,5 +1,5 @@
 ---
-title: "Sedimentation rates - DataPrep"
+title: "Sediment accumulation rates - DataPrep"
 output: html_notebook
 ---
 
@@ -23,8 +23,6 @@ library(terra)
 
 Projection based on https://projectionwizard.org/ using the AoI.
 
-*Is it possible to automate the selection of the CSR based on the AoI?*
-
 ```{r projection}
 crs <- "+proj=laea +lat_0=90 +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs" 
 res <- 4000
@@ -35,10 +33,8 @@ res <- 4000
 
 The area of interest is defined by the predicted sediment classes. Rocks and boulders (50) define areas outside the AoI.
 
-*Make sure to load the most up-to-date version of predicted sediment classes*
-
 ```{r aoi}
-AoI <- rast("N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Kornstørrelse/R/GrainSize/output/GrainSizeReg_folk8_classes_2023-06-28.tif")
+AoI <- rast("input/GrainSizeReg_folk8_classes_2023-06-28.tif")
 AoI[AoI == 11] <- 1
 AoI[AoI == 12] <- 1
 AoI[AoI == 13] <- 1
@@ -58,11 +54,11 @@ Potentially relevant predictor variables are loaded and a raster stack is create
 
 ```{r load_predictors}
 predictors <- rast("input/predictors_ngb.tif")
-mud <- extend(rast("N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Kornstørrelse/R/GSM_model/output/mud_2023-06-30.tif"), predictors)
+mud <- extend(rast("input/mud_2023-06-30.tif"), predictors)
 
-sedenv_prob <- extend(rast(list.files(path = "N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Sedimentasjon/R/SedEnv/output", pattern='SedEnv3_probabilities2023-07-01', full.names = TRUE)), predictors)
+sedenv_prob <- extend(rast("input/SedEnv3_probabilities2023-07-01.tif"), predictors)
 
-sedenv_maxprob <- extend(rast("N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Sedimentasjon/R/SedEnv/output/SedEnv3_max_probabilities2023-07-01.tif"), predictors)
+sedenv_maxprob <- extend(rast("input/SedEnv3_max_probabilities2023-07-01.tif"), predictors)
 
 sedenv_relprob <- sedenv_prob / sedenv_maxprob
 
