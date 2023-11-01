@@ -1,5 +1,5 @@
 ---
-title: "Sedimentation Rates - Main"
+title: "Sediment accumulation Rates - Main"
 output:
   html_document:
     df_print: paged
@@ -16,7 +16,6 @@ output:
 ```{r packages, message=FALSE, warning=FALSE}
 rm(list=ls())
 
-library(raster)
 library(terra)
 library(dplyr)
 library(rcompanion)
@@ -115,8 +114,6 @@ if(nrow(rm_resp) > 5000) {
 
 ## Boruta algorithm
 
-Although two models will be built, it is sufficient to run the Boruta algorithm only once, as the predictors and the sample locations are identical.
-
 ```{r boruta}
 set.seed(42)
 B <- Boruta(rm_resp[[1]] ~ .,data = rm_resp[2:ncol(rm_resp)], pValue = 0.05,
@@ -146,7 +143,6 @@ repeat{
 max(cor_result@results[,2])
 cor_result
 
-#sel_preds <- names(rm_resp)[2:ncol(rm_resp)]
 sel_preds <- cor_result@results$Variables
 seldata <- rm_resp[c(resp_type, sel_preds)]
 ```
@@ -196,19 +192,6 @@ for (i in sel_preds[2:length(sel_preds)]) {
     ylab(sel_preds[1]) +
     theme_bw())
 }
-```
-
-
-## Distances in environmental space 
-
-```{r env_space_dist}
-#dist_env <- plot_geodist(st_as_sf(resp_centr), predictors,
-#                     type = "feature",
-#                     variables = sel_preds,
-#                     showPlot = FALSE)
-
-#dist_env$plot
-#dist_env$plot + scale_x_log10()
 ```
 
 
@@ -308,7 +291,7 @@ Spatial blocks and folds are created. The folds will be used in a spatial k-fold
 
 Roberts et. al. (2017) suggest that blocks should be substantially bigger than the range of spatial autocorrelation (in model residual) to obtain realistic error estimates, while a buffer with the size of the spatial autocorrelation range would result in a good estimation of error.
 
-*Should we increase the block size? This could be gauged by looking at the geographic distances plot below. The block size might be right, when sample-to-prediction and CV distances look similar.*
+*Should we modify the block size? This could be gauged by looking at the geographic distances plot below. The block size might be right, when sample-to-prediction and CV distances look similar.*
 
 ```{r spatial_blocks, warning=FALSE}
 k <- 10 # Number of folds
@@ -466,21 +449,6 @@ impfig <- imp %>%
     
 impfig
 ```
-
-
-## Distances in environmental space including CV distances
-
-```{r env_space_dist2}
-#dist_env2 <- plot_geodist(st_as_sf(resp_centr), predictors,
-#                     type = "feature",
-#                     cvfolds= index,
-#                     variables = sel_preds,
-#                     showPlot = FALSE)
-
-#dist_env2$plot
-#dist_env2$plot + scale_x_log10()
-```
-
 
 
 ## Partial dependence
