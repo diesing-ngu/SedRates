@@ -168,7 +168,7 @@ rcl_matrix <- matrix(m, ncol = 3, byrow = TRUE)
 e99 <- classify(predictors$EROrelprob, rcl_matrix, right = FALSE)
 
 # Load AOA
-aoa <- rast("N:/Prosjekter/311700_MAREANO/311778_Automatisert_kartlegging/Sedimentasjon/R/SedEnv/output/SedEnv3_AOA2023-07-01.tif")
+aoa <- rast("input/SedEnv3_AOA2023-07-01.tif")
 
 mask <- e99 * aoa
 plot(mask)
