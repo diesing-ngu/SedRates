@@ -103,6 +103,8 @@ plot(predictors)
 
 ## Create a fishnet based on predictor raster
 
+A spatial polygons file is created. It consists of one square for every grid cell. It will be used later in the process to create centroids which hold the mean value of the sedimentation rate measurements. 
+
 ```{r fishnet}
 min_ext <- sum(predictors)
 min_ext[min_ext == 0] <- NA
@@ -214,6 +216,8 @@ resp <- rbind(resp, pseudo_smp)
 
 ## Centroids
 
+Sedimentation rate values are averaged for every grid cell in the raster stack and values are stored in a centroid.
+
 ```{r centroids, warning=FALSE}
 centroids <- st_join(fishnet, resp)
 centroids <- na.omit(centroids)
@@ -226,8 +230,9 @@ resp_centr <- centroids
 
 # Save files for use in main process
 
-```{r save_predictors}
+```{r save_files}
 write_sf(resp_centr, "input/SAR.shp", overwrite = TRUE)
+write_sf(st_as_sf(AoI), "input/Aoi.shp", overwrite = TRUE)
 writeRaster(predictors, "input/predictors.tif", overwrite = TRUE)
 ```
 
