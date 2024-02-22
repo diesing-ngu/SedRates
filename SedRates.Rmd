@@ -239,9 +239,14 @@ impfig <- imp %>%
     coord_flip() +
     xlab("") +
     ylab("% increase in MSE") +
+    ggtitle("Sediment accumulation rate") +
     theme_bw()
     
 impfig
+
+jpeg(filename = "output/SAR_VarImp.jpg", width = 12, height = 12, units = "cm", res = 500)
+impfig
+dev.off()
 ```
 
 
